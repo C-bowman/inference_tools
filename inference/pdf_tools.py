@@ -369,6 +369,11 @@ class GaussianKDE(DensityEstimator):
         self.s = sort(array(sample).flatten()) # sorted array of the samples
         self.max_cvs = max_cv_samples # maximum number of samples to be used for cross-validation
 
+        if self.s.size < 3:
+            raise ValueError(
+                """\n GaussianKDE error \n Not enough samples were given to estimate the PDF - at least 3 samples are required."""
+            )
+
         if bandwidth is None:
             self.h = self.simple_bandwidth_estimator()  # very simple bandwidth estimate
             if cross_validation:
@@ -512,7 +517,12 @@ class GaussianKDE(DensityEstimator):
         return reduce(logaddexp, generator) - log(len(samples) * sqrt(2*pi))
 
     def locate_mode(self):
-        lwr, upr = sample_hdi(self.s, 0.1) # use the 10% HDI to get close to the mode
+        # if there are enough samples, use the 20% HDI to bound the search for the mode
+        if self.s.size > 50:
+            lwr, upr = sample_hdi(self.s, 0.2)
+        else: # else just use the entire range of the samples
+            lwr, upr = self.s[0], self.s[-1]
+
         result = minimize_scalar(lambda x : -self.__call__(x), bounds = [lwr, upr], method = 'bounded')
         return result.x
 

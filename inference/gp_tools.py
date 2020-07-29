@@ -4,13 +4,14 @@
 """
 
 from numpy import abs, exp, log, dot, sqrt, argmin, diagonal, ndarray, arange
-from numpy import zeros, ones, array, where, pi, diag, eye, maximum
+from numpy import zeros, ones, array, where, pi, diag, eye, maximum, minimum
 from numpy import sum as npsum
 from numpy.random import random
 from scipy.special import erf, erfcx
 from numpy.linalg import inv, slogdet, solve, cholesky
 from scipy.linalg import solve_triangular
 from scipy.optimize import minimize, differential_evolution, fmin_l_bfgs_b
+from multiprocessing import Pool
 from itertools import product
 from warnings import warn
 from copy import copy
@@ -62,6 +63,7 @@ class SquaredExponential(object):
                 lwr = log(abs(dx[:,:,i]).mean())-4
                 upr = log(dx[:,:,i].max())+2
                 self.bounds.append((lwr,upr))
+        self.n_params = len(self.bounds)
 
     def __call__(self, u, v, theta):
         a = exp(theta[0])
@@ -96,9 +98,9 @@ class SquaredExponential(object):
         L = exp(theta[1:])
         C = exp((self.distances / L[None,None,:]**2).sum(axis=2)) + self.epsilon
         K = (a**2)*C
-        grads = [(2.*a)*C]
+        grads = [2.*K]
         for i,k in enumerate(L):
-            grads.append( (-2./k**3)*self.distances[:,:,i]*K )
+            grads.append( (-2./k**2)*self.distances[:,:,i]*K )
         return K, grads
 
     def get_bounds(self):
@@ -190,15 +192,67 @@ class RationalQuadratic(object):
         C = exp(-q*ln_F) + self.epsilon
 
         K = (a**2)*C
-        grads = [(2.*a)*C]
-        grads.append( -K*(ln_F - (Z/q)/F) )
+        grads = [2.*K, -K*(ln_F*q - Z/F)]
         G = 2*K/F
         for i,l in enumerate(L):
-            grads.append( G*(self.distances[:,:,i]/l**3) )
+            grads.append( G*(self.distances[:,:,i]/l**2) )
         return K, grads
 
     def get_bounds(self):
         return self.bounds
+
+
+
+
+
+
+class ConstantMean(object):
+    def __init__(self):
+        self.n_params = 1
+
+    def pass_data(self, x, y):
+        self.n_data = len(y)
+        w = y.max() - y.min()
+        self.bounds = [(y.min()-w, y.max()+w)]
+
+    def __call__(self, q, theta):
+        return theta[0]
+
+    def build_mean(self, theta):
+        return zeros(self.n_data) + theta[0]
+
+    def mean_and_gradients(self, theta):
+        return zeros(self.n_data) + theta[0], [ones(self.n_data)]
+
+
+
+
+
+
+class LinearMean(object):
+    def __init__(self):
+        pass
+
+    def pass_data(self, x, y):
+        self.x_mean = x.mean(axis=0)
+        self.dx = x - self.x_mean[None,:]
+        self.n_data = len(y)
+        self.n_params = 1 + x.shape[1]
+        w = y.max() - y.min()
+        grad_bounds = 10*w / (x.max(axis=0) - x.min(axis=0))
+        self.bounds = [(y.min()-2*w, y.max()+2*w)]
+        self.bounds.extend( [(-b,b) for b in grad_bounds] )
+
+    def __call__(self, q, theta):
+        return theta[0] + dot(q-self.x_mean, theta[1:]).squeeze()
+
+    def build_mean(self, theta):
+        return theta[0] + dot(self.dx, theta[1:])
+
+    def mean_and_gradients(self, theta):
+        grads = [ones(self.n_data)]
+        grads.extend( [v for v in self.dx.T] )
+        return theta[0] + dot(self.dx, theta[1:]), grads
 
 
 
@@ -217,9 +271,9 @@ class GpRegressor(object):
     normal distribution.
 
     :param x: \
-        The spatial coordinates of the y-data values. For the 1-dimensional case,
-        this should be a list or array of floats. For greater than 1 dimension,
-        a list of coordinate arrays or tuples should be given.
+        The x-data points as a 2D ``numpy.ndarray`` with shape (number of points,
+        number of dimensions). Alternatively, a list of array-like objects can be
+        given, which will be converted to a ``ndarray`` internally.
 
     :param y: The y-data values as a list or array of floats.
 
@@ -245,24 +299,35 @@ class GpRegressor(object):
     :param bool cross_val: \
         If set to ``True``, leave-one-out cross-validation is used to select the
         hyper-parameters in place of the marginal likelihood.
+
+    :param str optimizer: \
+        Selects the method used to optimize the hyper-parameter values. The available
+        options are "bfgs" for ``scipy.optimize.fmin_l_bfgs_b`` or "diffev" for
+        ``scipy.optimize.differential_evolution``.
+
+    :param int n_processes: \
+        Sets the number of processes used in optimizing the hyper-parameter values.
+        Multiple processes are only used when the optimizer keyword is set to "bfgs".
     """
-    def __init__(self, x, y, y_err = None, hyperpars = None, kernel = SquaredExponential, cross_val = False):
+    def __init__(self, x, y, y_err = None, hyperpars = None, kernel = SquaredExponential, mean = ConstantMean,
+                 cross_val = False, optimizer = 'bfgs', n_processes = 1):
 
-        self.N_points = len(x)
-        # identify the number of spatial dimensions
-        if hasattr(x[0], '__len__'):  # multi-dimensional case
-            self.N_dimensions = len(x[0])
-        else:  # 1D case
+        # store the data
+        self.x = array(x)
+        self.y = array(y).squeeze()
+
+        # determine the number of data points and spatial dimensions
+        self.N_points = self.y.shape[0]
+        if len(self.x.shape) == 1:
             self.N_dimensions = 1
+            self.x = self.x.reshape([self.x.shape[0], self.N_dimensions])
+        else:
+            self.N_dimensions = self.x.shape[1]
 
-        # load the spatial data into a 2D array
-        self.x = zeros([self.N_points,self.N_dimensions])
-        for i,v in enumerate(x): self.x[i,:] = v
+        if self.x.shape[0] != self.N_points:
+            raise ValueError('The given number of x-data points does not match the number of y-data values')
 
-        # data to fit
-        self.y = array(y)
-
-        # data errors covariance matrix
+        # build data errors covariance matrix
         self.sig = zeros([self.N_points, self.N_points])
         if y_err is not None:
             if len(y) == len(y_err):
@@ -277,60 +342,102 @@ class GpRegressor(object):
         else:
             self.cov = kernel
 
-        # pass the data to the kernel for pre-calculations
+        # create an instance of the mean function if only the class was passed
+        if isclass(mean):
+            self.mean = mean()
+        else:
+            self.mean = mean
+
+        # pass the data to the mean and covariance functions for pre-calculations
         self.cov.pass_data(self.x, self.y)
+        self.mean.pass_data(self.x, self.y)
+        # collect the bounds on all the hyper-parameters
+        self.hp_bounds = copy(self.mean.bounds)
+        self.hp_bounds.extend( copy(self.cov.bounds) )
+        # build slices to address the different parameter sets
+        self.n_hyperpars = len(self.hp_bounds)
+        self.mean_slice = slice(0, self.mean.n_params)
+        self.cov_slice = slice(self.mean.n_params, self.n_hyperpars)
 
         if cross_val:
             self.model_selector = self.loo_likelihood
-            self.model_selector_gradient = self. loo_likelihood_gradient
+            self.model_selector_gradient = self.loo_likelihood_gradient
         else:
             self.model_selector = self.marginal_likelihood
             self.model_selector_gradient = self.marginal_likelihood_gradient
 
-        self.hp_bounds = self.cov.get_bounds()
-
-        # if hyper-parameters are specified manually, allocate them
+        # if hyper-parameters are not specified, run an optimizer to select them
         if hyperpars is None:
-            hyperpars = self.optimize_hyperparameters()
+            if optimizer not in ['bfgs', 'diffev']:
+                optimizer = 'bfgs'
+                warn("""
+                     An invalid option was passed to the 'optimizer' keyword argument.
+                     The default option 'bfgs' was used instead.
+                     Valid options are 'bfgs' and 'diffev'.
+                     """)
+
+            if optimizer == 'diffev':
+                hyperpars = self.differential_evo()
+            else:
+                hyperpars = self.multistart_bfgs(n_processes=n_processes)
 
         # build the covariance matrix
         self.set_hyperparameters(hyperpars)
 
-    def __call__(self, points, theta = None):
+    def __call__(self, points):
         """
         Calculate the mean and standard deviation of the regression estimate at a series
         of specified spatial points.
 
-        :param list points: \
-            A list containing the spatial locations where the mean and standard deviation
-            of the estimate is to be calculated. In the 1D case this would be a list of
-            floats, or a list of coordinate tuples in the multi-dimensional case.
+        :param points: \
+            The points at which the mean and standard deviation of the regression estimate is to be
+            calculated, given as a 2D ``numpy.ndarray`` with shape (number of points, number of dimensions).
+            Alternatively, a list of array-like objects can be given, which will be converted
+            to a ``ndarray`` internally.
 
         :return: \
             Two 1D arrays, the first containing the means and the second containing the
             standard deviations.
         """
-        if theta is not None:
-            self.set_hyperparameters(theta)
 
         mu_q = []
         errs = []
         p = self.process_points(points)
 
         for q in p[:,None,:]:
-            K_qx = self.cov(q, self.x, self.hyperpars)
-            K_qq = self.cov(q, q, self.hyperpars)
-            mu_q.append(dot(K_qx, self.alpha)[0])
+            K_qx = self.cov(q, self.x, self.cov_hyperpars)
+            K_qq = self.cov(q, q, self.cov_hyperpars)
+
+            mu_q.append(dot(K_qx, self.alpha)[0] + self.mean(q,self.mean_hyperpars))
             v = solve_triangular(self.L, K_qx.T, lower = True)
             errs.append( K_qq[0,0] - npsum(v**2) )
 
         return array(mu_q), sqrt( abs(array(errs)) )
 
-    def set_hyperparameters(self, theta):
-        self.hyperpars = theta
-        self.K_xx = self.cov.build_covariance(theta) + self.sig
+    def set_hyperparameters(self, hyperpars):
+        """
+        Update the hyper-parameter values of the model.
+
+        :param hyperpars: \
+            An array containing the hyper-parameter values to be used.
+        """
+        # check to make sure the right number of hyper-parameters were given
+        if len(hyperpars) != self.n_hyperpars:
+            raise ValueError(
+                """
+                [ GpRegressor error ]
+                An incorrect number of hyper-parameters were passed via the 'hyperpars' keyword argument:
+                There are {} hyper-parameters but {} were given.
+                """.format(self.n_hyperpars, len(hyperpars))
+            )
+
+        self.hyperpars = hyperpars
+        self.mean_hyperpars = self.hyperpars[self.mean_slice]
+        self.cov_hyperpars = self.hyperpars[self.cov_slice]
+        self.K_xx = self.cov.build_covariance(self.cov_hyperpars) + self.sig
+        self.mu = self.mean.build_mean(self.mean_hyperpars)
         self.L = cholesky(self.K_xx)
-        self.alpha = solve_triangular(self.L.T, solve_triangular(self.L, self.y, lower = True))
+        self.alpha = solve_triangular(self.L.T, solve_triangular(self.L, self.y-self.mu, lower = True))
 
     def process_points(self, points):
         if type(points) is ndarray:
@@ -360,11 +467,11 @@ class GpRegressor(object):
         Calculate the mean and covariance of the gradient of the regression estimate
         with respect to the spatial coordinates at a series of specified points.
 
-        :param list points: \
-            A list containing the spatial locations where the mean vector and and covariance
-            matrix of the gradient of the regression estimate are to be calculated. In the 1D
-            case this would be a list of floats, or a list of coordinate tuples in the
-            multi-dimensional case.
+        :param points: \
+            The points at which the mean vector and and covariance matrix of the gradient of the
+            regression estimate are to be calculated, given as a 2D ``numpy.ndarray`` with shape
+            (number of points, number of dimensions).  Alternatively, a list of array-like objects
+            can be given, which will be converted to a ``ndarray`` internally.
 
         :return means, covariances: \
             Two arrays containing the means and covariances of each given spatial point. If the
@@ -376,8 +483,8 @@ class GpRegressor(object):
         vars = []
         p = self.process_points(points)
         for q in p[:,None,:]:
-            K_qx = self.cov(q, self.x, self.hyperpars)
-            A, R = self.cov.gradient_terms(q[0,:], self.x, self.hyperpars)
+            K_qx = self.cov(q, self.x, self.cov_hyperpars)
+            A, R = self.cov.gradient_terms(q[0,:], self.x, self.cov_hyperpars)
 
             B = (K_qx * self.alpha).T
             Q = solve_triangular(self.L, (A*K_qx).T, lower = True)
@@ -398,10 +505,11 @@ class GpRegressor(object):
         calculation of the spatial derivatives of acquisition functions like the expected
         improvement.
 
-        :param list points: \
-            A list containing the spatial locations where the gradient of the mean and
-            variance are to be calculated. In the 1D case this would be a list of floats,
-            or a list of coordinate tuples in the multi-dimensional case.
+        :param points: \
+            The points at which gradient of the predictive mean and variance are to be calculated,
+            given as a 2D ``numpy.ndarray`` with shape (number of points, number of dimensions).
+            Alternatively, a list of array-like objects can be given, which will be converted to a
+            ``ndarray`` internally.
 
         :return mean_gradients, variance_gradients: \
             Two arrays containing the gradient vectors of the mean and variance at each given
@@ -411,8 +519,8 @@ class GpRegressor(object):
         var_gradients = []
         p = self.process_points(points)
         for q in p[:,None,:]:
-            K_qx = self.cov(q, self.x, self.hyperpars)
-            A, _ = self.cov.gradient_terms(q[0,:], self.x, self.hyperpars)
+            K_qx = self.cov(q, self.x, self.cov_hyperpars)
+            A, _ = self.cov.gradient_terms(q[0,:], self.x, self.cov_hyperpars)
             B = (K_qx * self.alpha).T
             Q = solve_triangular(self.L.T, solve_triangular(self.L, K_qx.T, lower = True))
 
@@ -427,20 +535,21 @@ class GpRegressor(object):
 
     def build_posterior(self, points):
         """
-        Generates the full mean vector and covariance matrix for the GP fit at
-        a set of specified points.
+        Generates the full mean vector and covariance matrix for the Gaussian-process
+        posterior distribution at a set of specified points.
 
         :param points: \
-            A list containing the spatial locations which will be used to construct
-            the Gaussian process. In the 1D case this would be a list of floats, or
-            a list of coordinate tuples in the multi-dimensional case.
+            The points for which the mean vector and covariance matrix are to be calculated,
+            given as a 2D ``numpy.ndarray`` with shape (number of points, number of dimensions).
+            Alternatively, a list of array-like objects can be given, which will be converted to a
+            ``ndarray`` internally.
 
-        :return: The mean vector as a 1D array, followed by covariance matrix as a 2D array.
+        :return: The mean vector as a 1D array, followed by the covariance matrix as a 2D array.
         """
         v = self.process_points(points)
-        K_qx = self.cov(v, self.x, self.hyperpars)
-        K_qq = self.cov(v, v, self.hyperpars)
-        mu = dot(K_qx, self.alpha)
+        K_qx = self.cov(v, self.x, self.cov_hyperpars)
+        K_qq = self.cov(v, v, self.cov_hyperpars)
+        mu = dot(K_qx, self.alpha) + array([self.mean(p,self.mean_hyperpars) for p in v])
         sigma = K_qq - dot(K_qx, solve_triangular(self.L.T, solve_triangular(self.L, K_qx.T, lower = True)))
         return mu, sigma
 
@@ -470,13 +579,14 @@ class GpRegressor(object):
         Rasmussen & Williams.
         """
         try:
-            K_xx = self.cov.build_covariance(theta) + self.sig
+            K_xx = self.cov.build_covariance(theta[self.cov_slice]) + self.sig
+            mu = self.mean.build_mean(theta[self.mean_slice])
             L = cholesky(K_xx)
 
             # Use the Cholesky decomposition of the covariance to find its inverse
             I = eye(len(self.x))
             iK = solve_triangular(L.T, solve_triangular(L, I, lower = True))
-            alpha = solve_triangular(L.T, solve_triangular(L, self.y, lower = True))
+            alpha = solve_triangular(L.T, solve_triangular(L, self.y-mu, lower = True))
             var = 1. / diag(iK)
             return -0.5*(var*alpha**2 + log(var)).sum()
         except:
@@ -491,23 +601,35 @@ class GpRegressor(object):
         This implementation is based on equations (5.10, 5.11, 5.12, 5.13, 5.14)
         from Rasmussen & Williams.
         """
-        K_xx, grad_K = self.cov.covariance_and_gradients(theta)
+        K_xx, grad_K = self.cov.covariance_and_gradients(theta[self.cov_slice])
         K_xx += self.sig
+        mu, grad_mu = self.mean.mean_and_gradients(theta[self.mean_slice])
         L = cholesky(K_xx)
 
         # Use the Cholesky decomposition of the covariance to find its inverse
         I = eye(len(self.x))
         iK = solve_triangular(L.T, solve_triangular(L, I, lower = True))
-        alpha = solve_triangular(L.T, solve_triangular(L, self.y, lower = True))
+        alpha = solve_triangular(L.T, solve_triangular(L, self.y-mu, lower = True))
         var = 1. / diag(iK)
         LOO = -0.5*(var*alpha**2 + log(var)).sum()
 
-        grad = zeros(len(grad_K))
-        for i,dK in enumerate(grad_K):
+        cov_gradients = []
+        for dK in grad_K:
             Z = iK.dot(dK)
-            grad[i] = ((alpha*Z.dot(alpha) - 0.5*(1 + var*alpha**2)*diag(Z.dot(iK))) * var).sum()
+            g = ((alpha*Z.dot(alpha) - 0.5*(1 + var*alpha**2)*diag(Z.dot(iK))) * var).sum()
+            cov_gradients.append(g)
 
-        return LOO, grad*exp(theta)
+        mean_gradients = []
+        for dmu in grad_mu:
+            Z = iK.dot(dmu)
+            g = (alpha*var*Z).sum()
+            mean_gradients.append(g)
+
+        grad = zeros(self.n_hyperpars)
+        grad[self.cov_slice] = array(cov_gradients)
+        grad[self.mean_slice] = array(mean_gradients)
+
+        return LOO, grad
 
     def marginal_likelihood(self, theta):
         """
@@ -515,12 +637,12 @@ class GpRegressor(object):
 
         This implementation is based on equation (5.8) from Rasmussen & Williams.
         """
-        K_xx = self.cov.build_covariance(theta) + self.sig
-
+        K_xx = self.cov.build_covariance(theta[self.cov_slice]) + self.sig
+        mu = self.mean.build_mean(theta[self.mean_slice])
         try: # protection against singular matrix error crash
             L = cholesky(K_xx)
-            alpha = solve_triangular(L.T, solve_triangular(L, self.y, lower = True))
-            return -0.5*dot( self.y.T, alpha ) - log(diagonal(L)).sum()
+            alpha = solve_triangular(L.T, solve_triangular(L, self.y-mu, lower = True))
+            return -0.5*dot( (self.y-mu).T, alpha ) - log(diagonal(L)).sum()
         except:
             warn('Cholesky decomposition failure in marginal_likelihood')
             return -1e50
@@ -532,38 +654,51 @@ class GpRegressor(object):
 
         This implementation is based on equations (5.8, 5.9) from Rasmussen & Williams.
         """
-        K_xx, grad_K = self.cov.covariance_and_gradients(theta)
+        K_xx, grad_K = self.cov.covariance_and_gradients(theta[self.cov_slice])
         K_xx += self.sig
-
+        mu, grad_mu = self.mean.mean_and_gradients(theta[self.mean_slice])
         # get the cholesky decomposition
         L = cholesky(K_xx)
         # calculate the log-marginal likelihood
-        alpha = solve_triangular(L.T, solve_triangular(L, self.y, lower = True))
-        LML = -0.5*dot( self.y.T, alpha ) - log(diagonal(L)).sum()
-        # calculate the gradients
+        alpha = solve_triangular(L.T, solve_triangular(L, self.y-mu, lower = True))
+        LML = -0.5*dot( (self.y-mu).T, alpha ) - log(diagonal(L)).sum()
+        # calculate the mean parameter gradients
+        grad = zeros(self.n_hyperpars)
+        grad[self.mean_slice] = array([(alpha * dmu).sum() for dmu in grad_mu])
+        # calculate the covariance parameter gradients
         iK = solve_triangular(L.T, solve_triangular(L, eye(L.shape[0]), lower = True))
         Q = alpha[:,None]*alpha[None,:] - iK
-        grad = array([ 0.5*(Q*dK.T).sum() for dK in grad_K])*exp(theta)
+        grad[self.cov_slice] = array([0.5 * (Q * dK.T).sum() for dK in grad_K])
         return LML, grad
 
-    def optimize_hyperparameters(self):
+    def differential_evo(self):
         # optimise the hyperparameters
         opt_result = differential_evolution(lambda x : -self.model_selector(x), self.hp_bounds)
         return opt_result.x
 
-    def bfgs_func(self, theta):
+    def bfgs_cost_func(self, theta):
         y, grad_y = self.model_selector_gradient(theta)
         return -y, -grad_y
 
-    def multistart_bfgs(self, starts = None):
+    def launch_bfgs(self, x0):
+        return fmin_l_bfgs_b(self.bfgs_cost_func, x0, approx_grad = False, bounds = self.hp_bounds)
+
+    def multistart_bfgs(self, starts = None, n_processes = 1):
         if starts is None: starts = int(2*sqrt(len(self.hp_bounds)))+1
         # starting positions guesses by random sampling + one in the centre of the hypercube
         lwr, upr = [array([k[i] for k in self.hp_bounds]) for i in [0,1]]
         starting_positions = [ lwr + (upr-lwr)*random(size = len(self.hp_bounds)) for _ in range(starts-1) ]
         starting_positions.append(0.5*(lwr+upr))
+
         # run BFGS for each starting position
-        results = [ fmin_l_bfgs_b(self.bfgs_func, x0, approx_grad = False, bounds = self.hp_bounds) for x0 in starting_positions ]
+        if n_processes == 1:
+            results = [self.launch_bfgs(x0) for x0 in starting_positions]
+        else:
+            workers = Pool(n_processes)
+            results = workers.map(self.launch_bfgs, starting_positions)
+
         # extract best solution
+        # print(results[0])
         solution = sorted(results, key = lambda x : x[1])[0][0]
         return solution
 
@@ -816,7 +951,7 @@ class ExpectedImprovement(object):
         self.ln2pi = log(2*pi)
 
         self.name = 'Expected improvement'
-        self.convergence_description = '$\mathrm{EI}_{\mathrm{max}} \; / \; (y_{\mathrm{max}} - y_{\mathrm{min}})$'
+        self.convergence_description = r'$\mathrm{EI}_{\mathrm{max}} \; / \; (y_{\mathrm{max}} - y_{\mathrm{min}})$'
 
     def update_gp(self, gp):
         self.gp = gp
@@ -862,7 +997,14 @@ class ExpectedImprovement(object):
             ln_EI = log(EI)
             grad_ln_EI = (0.5*pdf*dvar/sig[0] + dmu*cdf) / EI
 
-        return -ln_EI, -grad_ln_EI.squeeze()
+        # flip sign on the value and gradient since we're using a minimizer
+        ln_EI = -ln_EI
+        grad_ln_EI = -grad_ln_EI
+        # make sure outputs are ndarray in the 1D case
+        if type(ln_EI) is not ndarray: ln_EI = array(ln_EI)
+        if type(grad_ln_EI) is not ndarray: grad_ln_EI = array(grad_ln_EI)
+
+        return ln_EI, grad_ln_EI.squeeze()
 
     def normal_pdf(self, z):
         return exp(-0.5*z**2)*self.ir2pi
@@ -877,24 +1019,19 @@ class ExpectedImprovement(object):
         return -0.5*(z**2 + self.ln2pi)
 
     def starting_positions(self, bounds):
-        lwr, upr = [array([k[i] for k in bounds]) for i in [0,1]]
+        lwr, upr = [array([k[i] for k in bounds], dtype=float) for i in [0,1]]
         widths = upr-lwr
-        starts = []
-        for x0 in self.gp.x:
-            # get the gradient at the current point
-            y0, g0 = self.opt_func_gradient(x0)
-            for i in range(20):
-                step = 2e-3 / (abs(g0) / widths).max()
 
-                x1 = x0-step*g0
-                y1, g1 = self.opt_func_gradient(x1)
-                if (y1 < y0) and ((x1 >= lwr)&(x1 <= upr)).all():
-                    x0 = x1.copy()
-                    g0 = g1.copy()
-                    y0 = copy(y1)
-                else:
-                    break
-            starts.append(x0)
+        lwr += widths*0.01
+        upr -= widths*0.01
+        starts = []
+        L = len(widths)
+        for x0 in self.gp.x:
+            samples = [ x0 + 0.02*widths*(2*random(size=L)-1) for i in range(20) ]
+            samples = [minimum(upr, maximum(lwr, s)) for s in samples]
+            samples = sorted(samples, key=self.opt_func)
+            starts.append(samples[0])
+
         return starts
 
     def convergence_metric(self, x):
@@ -925,7 +1062,7 @@ class UpperConfidenceBound(object):
     def __init__(self, kappa = 2):
         self.kappa = kappa
         self.name = 'Upper confidence bound'
-        self.convergence_description = '$\mathrm{UCB}_{\mathrm{max}} - y_{\mathrm{max}}$'
+        self.convergence_description = r'$\mathrm{UCB}_{\mathrm{max}} - y_{\mathrm{max}}$'
 
     def update_gp(self, gp):
         self.gp = gp
@@ -944,10 +1081,28 @@ class UpperConfidenceBound(object):
         dmu, dvar = self.gp.spatial_derivatives(x)
         ucb = mu[0] + self.kappa*sig[0]
         grad_ucb = dmu + 0.5*self.kappa*dvar/sig[0]
-        return -ucb, -grad_ucb.squeeze()
+        # flip sign on the value and gradient since we're using a minimizer
+        ucb = -ucb
+        grad_ucb = -grad_ucb
+        # make sure outputs are ndarray in the 1D case
+        if type(ucb) is not ndarray: ucb = array(ucb)
+        if type(grad_ucb) is not ndarray: grad_ucb = array(grad_ucb)
+        return ucb, grad_ucb.squeeze()
 
     def starting_positions(self, bounds):
-        starts = [v for v in self.gp.x]
+        lwr, upr = [array([k[i] for k in bounds], dtype=float) for i in [0,1]]
+        widths = upr-lwr
+
+        lwr += widths*0.01
+        upr -= widths*0.01
+        starts = []
+        L = len(widths)
+        for x0 in self.gp.x:
+            samples = [ x0 + 0.02*widths*(2*random(size=L)-1) for i in range(20) ]
+            samples = [minimum(upr, maximum(lwr, s)) for s in samples]
+            samples = sorted(samples, key=self.opt_func)
+            starts.append(samples[0])
+
         return starts
 
     def convergence_metric(self, x):
@@ -971,7 +1126,8 @@ class MaxVariance(object):
     prediction of the function.
     """
     def __init__(self):
-        pass
+        self.name = 'Max variance'
+        self.convergence_description = r'$\sqrt{\mathrm{Var}\left[x\right]}$'
 
     def update_gp(self, gp):
         self.gp = gp
@@ -988,17 +1144,19 @@ class MaxVariance(object):
     def opt_func_gradient(self, x):
         _, sig = self.gp(x)
         _, dvar = self.gp.spatial_derivatives(x)
-        return -sig[0]**2, -dvar.squeeze()
+        aq = -sig**2
+        aq_grad = -dvar
+        if type(aq) is not ndarray: aq = array(aq)
+        if type(aq_grad) is not ndarray: aq_grad = array(aq_grad)
+        return aq.squeeze(), aq_grad.squeeze()
 
     def starting_positions(self, bounds):
         lwr, upr = [array([k[i] for k in bounds]) for i in [0,1]]
         starts = [lwr + (upr - lwr)*random(size=len(bounds)) for _ in range(len(self.gp.y))]
         return starts
 
-    def get_name(self):
-        return 'Max variance'
-
-
+    def convergence_metric(self, x):
+        return sqrt(self.__call__(x))
 
 
 
@@ -1017,12 +1175,12 @@ class GpOptimiser(object):
     search for the global maximum, on initialisation GpOptimiser must be provided with
     at least two evaluations of the function which is to be maximised.
 
-    :param x: \
+    :param list x: \
         The spatial coordinates of the y-data values. For the 1-dimensional case,
         this should be a list or array of floats. For greater than 1 dimension,
         a list of coordinate arrays or tuples should be given.
 
-    :param y: The y-data values as a list or array of floats.
+    :param list y: The y-data values as a list or array of floats.
 
     :keyword y_err: \
         The error on the y-data values supplied as a list or array of floats.
@@ -1057,9 +1215,18 @@ class GpOptimiser(object):
         imported from the ``gp_tools`` module and then passed as arguments - see their
         documentation for the list of available acquisition functions. If left unspecified,
         the ``ExpectedImprovement`` acquisition function is used by default.
+
+    :param str optimizer: \
+        Selects the optimization method used for selecting hyper-parameter values proposed
+        evaluations. Available options are "bfgs" for ``scipy.optimize.fmin_l_bfgs_b`` or
+        "diffev" for ``scipy.optimize.differential_evolution``.
+
+    :param int n_processes: \
+        Sets the number of processes used when selecting hyper-parameters or proposed evaluations.
+        Multiple processes are only used when the optimizer keyword is set to "bfgs".
     """
     def __init__(self, x, y, y_err = None, bounds = None, hyperpars = None, kernel = SquaredExponential,
-                 cross_val = False, acquisition = ExpectedImprovement):
+                 cross_val = False, acquisition = ExpectedImprovement, optimizer = 'bfgs', n_processes = 1):
         self.x = list(x)
         self.y = list(y)
         self.y_err = y_err
@@ -1072,7 +1239,10 @@ class GpOptimiser(object):
 
         self.kernel = kernel
         self.cross_val = cross_val
-        self.gp = GpRegressor(x, y, y_err=y_err, hyperpars=hyperpars, kernel=kernel, cross_val=cross_val)
+        self.n_processes = n_processes
+        self.optimizer = optimizer
+        self.gp = GpRegressor(x, y, y_err=y_err, hyperpars=hyperpars, kernel=kernel, cross_val=cross_val,
+                              optimizer=self.optimizer, n_processes=self.n_processes)
 
         # if the class has been passed instead of an instance, create an instance
         if isclass(acquisition):
@@ -1113,7 +1283,8 @@ class GpOptimiser(object):
                 raise ValueError('y_err must be specified for new evaluations if y_err was specified during __init__')
 
         # re-train the GP
-        self.gp = GpRegressor(self.x, self.y, y_err=self.y_err, kernel = self.kernel, cross_val = self.cross_val)
+        self.gp = GpRegressor(self.x, self.y, y_err=self.y_err, kernel = self.kernel, cross_val = self.cross_val,
+                              optimizer=self.optimizer, n_processes=self.n_processes)
         self.mu_max = max(self.y)
 
         # update the acquisition function info
@@ -1126,16 +1297,24 @@ class GpOptimiser(object):
         if hasattr(funcval, '__len__'): funcval = funcval[0]
         return solution, funcval
 
+    def launch_bfgs(self, x0):
+        return fmin_l_bfgs_b(self.acquisition.opt_func_gradient, x0, approx_grad = False, bounds = self.bounds, pgtol=1e-10)
+
     def multistart_bfgs(self):
         starting_positions = self.acquisition.starting_positions(self.bounds)
         # run BFGS for each starting position
-        results = [ fmin_l_bfgs_b(self.acquisition.opt_func_gradient, x0, approx_grad = False, bounds = self.bounds, pgtol=1e-10) for x0 in starting_positions ]
+        if self.n_processes == 1:
+            results = [ self.launch_bfgs(x0) for x0 in starting_positions ]
+        else:
+            workers = Pool(self.n_processes)
+            results = workers.map(self.launch_bfgs, starting_positions)
         # extract best solution
-        solution, funcval = sorted(results, key = lambda x : x[1])[0][:2]
-        if hasattr(funcval, '__len__'): funcval = funcval[0]
+        best_result = sorted(results, key = lambda x : float(x[1]))[0]
+        solution = best_result[0]
+        funcval = float(best_result[1])
         return solution, funcval
 
-    def propose_evaluation(self, bfgs = False):
+    def propose_evaluation(self):
         """
         Request a proposed location for the next evaluation. This proposal is
         selected by maximising the chosen acquisition function.
@@ -1147,7 +1326,7 @@ class GpOptimiser(object):
 
         :return: location of the next proposed evaluation.
         """
-        if bfgs:
+        if self.optimizer == 'bfgs':
             # find the evaluation point which maximises the acquisition function
             proposed_ev, max_acq = self.multistart_bfgs()
         else:
